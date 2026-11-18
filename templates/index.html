@@ -53,6 +53,12 @@
   }
   .ghost:hover { background:rgba(255,255,255,.1); }
   .ghost.off { color:var(--mut); }
+  select {
+    background:rgba(255,255,255,.05); color:var(--txt); border:1px solid var(--line); border-radius:10px;
+    padding:8px 10px; font-size:13px; font-weight:600; cursor:pointer; outline:none;
+  }
+  select option { background:#151925; color:var(--txt); }
+  .pill.ok { background:rgba(34,211,160,.12); color:var(--ok); }
 
   /* ---------- alarma ---------- */
   #alarmaOverlay {
@@ -62,12 +68,13 @@
   #alarmaOverlay.on { opacity:1; animation:flash .7s infinite alternate; }
   @keyframes flash { from { opacity:1; } to { opacity:.35; } }
   #banner {
-    position:fixed; top:74px; left:50%; transform:translate(-50%,-140%); z-index:30; transition:transform .35s;
+    position:fixed; top:86px; left:50%; transform:translate(-50%,-20px); z-index:30; transition:.3s;
+    opacity:0; visibility:hidden; pointer-events:none;
     background:linear-gradient(90deg,#ff2d46,#ff6b3d); color:#fff; padding:12px 26px; border-radius:99px;
     font-weight:800; letter-spacing:1.5px; font-size:14px; box-shadow:0 10px 40px rgba(255,45,70,.55);
     display:flex; align-items:center; gap:10px;
   }
-  #banner.on { transform:translate(-50%,0); }
+  #banner.on { transform:translate(-50%,0); opacity:1; visibility:visible; }
 
   /* ---------- layout ---------- */
   main { max-width:1500px; margin:0 auto; padding:22px 28px 40px; display:grid; grid-template-columns:minmax(0,1.5fr) minmax(0,1fr); gap:18px; }
@@ -180,7 +187,7 @@
 <div id="alarmaOverlay"></div>
 <div id="banner">
   <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg>
-  ALARMA &middot; PERSONA NO REGISTRADA
+  <span id="bannerTxt">ALARMA &middot; PERSONA NO REGISTRADA</span>
 </div>
 
 <header>
@@ -194,9 +201,16 @@
     </div>
   </div>
   <div class="head-right">
-    <button class="ghost" id="btnSonido" title="Activar o silenciar la sirena">
+    <select id="selSonido" title="Tipo de sonido de la alarma">
+      <option value="digital">Alarma digital</option>
+      <option value="alerta">Alerta rapida</option>
+      <option value="dos_tonos">Dos tonos</option>
+      <option value="sirena">Sirena suave</option>
+    </select>
+    <button class="ghost" id="btnProbar" title="Escuchar el sonido elegido">Probar</button>
+    <button class="ghost" id="btnSonido" title="Activar o silenciar la alarma">
       <svg id="icoSonido" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H2v6h4l5 4V5z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M19 5a10 10 0 0 1 0 14"/></svg>
-      <span id="txtSonido">Sirena activa</span>
+      <span id="txtSonido">Sonido activo</span>
     </button>
     <div id="estado" class="pill"><span class="dot"></span><span id="estadoTxt">Sistema activo</span></div>
   </div>
@@ -324,7 +338,7 @@ const grafico = new Chart($('grafico'), {
 
 /* ---------- estado en vivo ---------- */
 function pintarSonido() {
-  $('txtSonido').textContent = sonidoActivo ? 'Sirena activa' : 'Sirena silenciada';
+  $('txtSonido').textContent = sonidoActivo ? 'Sonido activo' : 'Silenciado';
   $('btnSonido').classList.toggle('off', !sonidoActivo);
   $('icoSonido').innerHTML = sonidoActivo
     ? '<path d="M11 5 6 9H2v6h4l5 4V5z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M19 5a10 10 0 0 1 0 14"/>'
@@ -343,11 +357,13 @@ async function actualizarEstado() {
 
     const pill = $('estado');
     if (e.alarma) { pill.className = 'pill bad'; $('estadoTxt').textContent = 'ALARMA'; }
+    else if (e.nombres && e.nombres.length) { pill.className = 'pill ok'; $('estadoTxt').textContent = 'Acceso autorizado: ' + e.nombres.join(', '); }
     else if (!e.registrados) { pill.className = 'pill warn'; $('estadoTxt').textContent = 'Sin personas registradas'; }
     else { pill.className = 'pill'; $('estadoTxt').textContent = 'Sistema activo'; }
 
     sonidoActivo = e.sonido;
     pintarSonido();
+    if (document.activeElement !== $('selSonido')) $('selSonido').value = e.tipo_sonido;
   } catch (_) {}
 }
 
@@ -510,8 +526,18 @@ $('btnSonido').onclick = async () => {
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({activo: sonidoActivo})
   });
-  toast(sonidoActivo ? 'Sirena activada' : 'Sirena silenciada', 'ok');
+  toast(sonidoActivo ? 'Sonido activado' : 'Sonido silenciado', 'ok');
 };
+
+$('selSonido').onchange = async () => {
+  await fetch('/api/sonido', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({tipo: $('selSonido').value})
+  });
+  await fetch('/api/probar_sonido', {method: 'POST'});
+};
+$('btnProbar').onclick = () => fetch('/api/probar_sonido', {method: 'POST'});
 
 /* ---------- arranque ---------- */
 actualizarEstado(); actualizarResumen(); actualizarEventos(); actualizarPersonas();

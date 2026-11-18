@@ -8,11 +8,13 @@ Correr:
     python app.py
     Abrir http://localhost:5000
 """
+import io
 import os
 import pickle
 import sqlite3
 import threading
 import time
+import wave
 from datetime import datetime
 
 import cv2
@@ -35,14 +37,15 @@ os.makedirs(SNAP_DIR, exist_ok=True)
 
 # ---------- modelos ----------
 yolo = YOLO("yolov8n.pt")
-caras = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
+caras = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"],
+                     allowed_modules=["detection", "recognition"])  # sin modulos extra = mas rapido
 caras.prepare(ctx_id=-1, det_size=(320, 320))
 model_lock = threading.Lock()   # InsightFace lo usan la camara y el registro
 
 # ---------- estado compartido ----------
 estado_lock = threading.Lock()
 estado = {"jpeg": None, "frame": None, "personas": 0, "conocidos": 0,
-          "desconocidos": 0, "fps": 0.0, "alarma_hasta": 0.0}
+          "desconocidos": 0, "fps": 0.0, "alarma_hasta": 0.0, "nombres": []}
 
 db_lock = threading.Lock()
 if os.path.exists(DB_PATH):
@@ -75,25 +78,81 @@ def registrar_evento(tipo, nombre, sim, foto=None):
     con.close()
 
 
-SONIDO = {"activo": True}
+SONIDO = {"activo": True, "tipo": "digital"}
+
+
+def _wav(onda, sr):
+    """Convierte una onda (-1..1) en bytes WAV listos para reproducir."""
+    pcm = (np.clip(onda, -1, 1) * 32767 * 0.85).astype(np.int16)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sr)
+        w.writeframes(pcm.tobytes())
+    return buf.getvalue()
+
+
+def _suavizar(seg, sr, ms=8):
+    """Entrada y salida suaves para que no haya 'clics' entre tonos."""
+    n = int(sr * ms / 1000)
+    seg = seg.copy()
+    seg[:n] *= np.linspace(0, 1, n)
+    seg[-n:] *= np.linspace(1, 0, n)
+    return seg
+
+
+def generar_sonidos(sr=22050):
+    tiempo = lambda s: np.linspace(0, s, int(sr * s), endpoint=False)
+    sonidos = {}
+
+    # 1) Sirena suave: el tono sube y baja de forma continua (500 a 1000 Hz)
+    t = tiempo(3.0)
+    f = 750 + 250 * np.sin(2 * np.pi * 1.0 * t - np.pi / 2)
+    fase = 2 * np.pi * np.cumsum(f) / sr
+    onda = (np.sin(fase) + 0.3 * np.sin(2 * fase)) / 1.3
+    sonidos["sirena"] = _wav(_suavizar(onda, sr, 30), sr)
+
+    # 2) Alarma digital: pitidos secos y agudos, tipo alarma de edificio
+    t = tiempo(0.10)
+    pitido = _suavizar(np.sin(2 * np.pi * 2600 * t), sr, 4)
+    silencio = np.zeros(int(sr * 0.09))
+    sonidos["digital"] = _wav(np.concatenate([pitido, silencio] * 10), sr)
+
+    # 3) Dos tonos: alterna grave y agudo, tipo ambulancia
+    t = tiempo(0.45)
+    alto = _suavizar(np.sin(2 * np.pi * 960 * t), sr, 10)
+    bajo = _suavizar(np.sin(2 * np.pi * 700 * t), sr, 10)
+    sonidos["dos_tonos"] = _wav(np.concatenate([alto, bajo] * 3), sr)
+
+    # 4) Alerta: tres notas que suben rapido, repetidas (tipo alerta de videojuego)
+    notas = []
+    for _ in range(4):
+        for hz in (800, 1000, 1250):
+            notas.append(_suavizar(np.sin(2 * np.pi * hz * tiempo(0.11)), sr, 4))
+            notas.append(np.zeros(int(sr * 0.025)))
+        notas.append(np.zeros(int(sr * 0.18)))
+    sonidos["alerta"] = _wav(np.concatenate(notas), sr)
+
+    return sonidos
+
+
+SONIDOS = generar_sonidos()
+
+
+def reproducir(tipo):
+    def _play():
+        try:
+            import winsound
+            winsound.PlaySound(SONIDOS[tipo], winsound.SND_MEMORY)
+        except ImportError:
+            print("\a", end="", flush=True)
+    threading.Thread(target=_play, daemon=True).start()
 
 
 def sonar_alarma():
-    """Sirena tipo policia: el tono sube y baja dos veces."""
-    if not SONIDO["activo"]:
-        return
-
-    def _sirena():
-        try:
-            import winsound
-            for _ in range(2):
-                for f in range(600, 1500, 60):
-                    winsound.Beep(f, 25)
-                for f in range(1500, 600, -60):
-                    winsound.Beep(f, 25)
-        except ImportError:
-            print("\a", end="", flush=True)
-    threading.Thread(target=_sirena, daemon=True).start()
+    if SONIDO["activo"]:
+        reproducir(SONIDO["tipo"])
 
 
 # ---------- reconocimiento ----------
@@ -129,6 +188,7 @@ def bucle_camara():
         h, w = frame.shape[:2]
         personas = conocidos = desconocidos = 0
         sim_desc = 0.0
+        nombres_ahora = []
 
         for box in yolo(frame, classes=[0], conf=0.5, verbose=False)[0].boxes:
             personas += 1
@@ -143,6 +203,7 @@ def bucle_camara():
                 nombre, sim = identificar(detectadas[0].normed_embedding)
                 if nombre:
                     conocidos += 1
+                    nombres_ahora.append(nombre)
                     color, texto = (0, 255, 0), f"{nombre} ({sim:.2f})"
                     if time.time() - ultimo_acceso.get(nombre, 0) > COOLDOWN_ACCESO:
                         ultimo_acceso[nombre] = time.time()
@@ -157,14 +218,15 @@ def bucle_camara():
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
         seguidos = seguidos + 1 if desconocidos else 0
+        if seguidos >= FRAMES_ALARMA:
+            with estado_lock:
+                estado["alarma_hasta"] = time.time() + 1.5   # se apaga ~1.5 s despues de que se va
         if seguidos >= FRAMES_ALARMA and time.time() - ultima_alarma > COOLDOWN_ALARMA:
             ultima_alarma = time.time()
             archivo = f"alarma_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
             cv2.imwrite(os.path.join(SNAP_DIR, archivo), vista)
             registrar_evento("ALARMA", "Desconocido", sim_desc, archivo)
             sonar_alarma()
-            with estado_lock:
-                estado["alarma_hasta"] = time.time() + COOLDOWN_ALARMA
 
         ahora = time.time()
         fps = 1.0 / max(ahora - t_prev, 1e-3)
@@ -172,7 +234,7 @@ def bucle_camara():
         ok, buf = cv2.imencode(".jpg", vista, [cv2.IMWRITE_JPEG_QUALITY, 80])
         with estado_lock:
             estado.update(personas=personas, conocidos=conocidos, desconocidos=desconocidos,
-                          fps=round(fps, 1))
+                          fps=round(fps, 1), nombres=sorted(set(nombres_ahora)))
             if ok:
                 estado["jpeg"] = buf.tobytes()
 
@@ -201,18 +263,29 @@ def video():
 @app.get("/api/estado")
 def api_estado():
     with estado_lock:
-        datos = {k: estado[k] for k in ("personas", "conocidos", "desconocidos", "fps")}
+        datos = {k: estado[k] for k in ("personas", "conocidos", "desconocidos", "fps", "nombres")}
         datos["alarma"] = time.time() < estado["alarma_hasta"]
     with db_lock:
         datos["registrados"] = len(personas_db)
     datos["sonido"] = SONIDO["activo"]
+    datos["tipo_sonido"] = SONIDO["tipo"]
     return jsonify(datos)
 
 
 @app.post("/api/sonido")
 def api_sonido():
-    SONIDO["activo"] = bool((request.get_json(silent=True) or {}).get("activo", True))
-    return jsonify(ok=True, activo=SONIDO["activo"])
+    d = request.get_json(silent=True) or {}
+    if "activo" in d:
+        SONIDO["activo"] = bool(d["activo"])
+    if d.get("tipo") in SONIDOS:
+        SONIDO["tipo"] = d["tipo"]
+    return jsonify(ok=True, activo=SONIDO["activo"], tipo=SONIDO["tipo"])
+
+
+@app.post("/api/probar_sonido")
+def api_probar_sonido():
+    reproducir(SONIDO["tipo"])
+    return jsonify(ok=True)
 
 
 @app.get("/api/eventos")
